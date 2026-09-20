@@ -848,11 +848,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.saveChats()
 		}
 		if req.Stream {
-			werr := upstream.StreamCapture(w, rc, model, func(comp *upstream.RawCompletion) {
+			var usage func(*upstream.RawCompletion) map[string]any
+			if req.IncludeUsage {
+				usage = func(comp *upstream.RawCompletion) map[string]any { return usageEstimate(msgs, comp) }
+			}
+			werr := upstream.StreamCaptureWithUsage(w, rc, model, func(comp *upstream.RawCompletion) {
 				storeChat()
 				// 流式传输中定期保活
 				h.cfg.Pool.PingKeepalive(acct.Name)
-			})
+			}, usage)
 			rc.Close()
 			h.cfg.Pool.ReleaseLock(acct.Name) // 释放锁
 			if werr != nil {
@@ -999,7 +1003,10 @@ func fromUpstreamToolCalls(calls []upstream.ChatToolCall) []openAIToolCall {
 	return out
 }
 
-func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) map[string]int {
+func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) map[string]any {
+	if comp.Usage != nil {
+		return comp.Usage
+	}
 	var pt int
 	for _, m := range msgs {
 		switch content := m.Content.(type) {
@@ -1011,11 +1018,11 @@ func usageEstimate(msgs []upstream.ChatMessage, comp *upstream.RawCompletion) ma
 		}
 	}
 	ct := (len([]rune(comp.Content))+len([]rune(comp.Reasoning)))/4 + 1
-	return map[string]int{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+	return map[string]any{"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
 }
 
 // buildCompletion 组装非流式响应。
-func buildCompletion(model, reasoning, content string, calls []openAIToolCall, finish, chatID string, usage map[string]int) map[string]any {
+func buildCompletion(model, reasoning, content string, calls []openAIToolCall, finish, chatID string, usage map[string]any) map[string]any {
 	message := map[string]any{"role": "assistant"}
 	if len(calls) > 0 {
 		message["tool_calls"] = toOpenAIToolCalls(calls)

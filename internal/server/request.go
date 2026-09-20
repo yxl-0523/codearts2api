@@ -40,6 +40,7 @@ type toolChoiceOpenAI struct {
 type chatRequest struct {
 	Model           string
 	Stream          bool
+	IncludeUsage    bool
 	ReasoningEffort string
 	MaxTokens       *int
 	Temperature     *float64
@@ -53,8 +54,11 @@ type chatRequest struct {
 // parseChatRequest 解析并校验请求体。
 func parseChatRequest(body []byte) (*chatRequest, error) {
 	var raw struct {
-		Model               string            `json:"model"`
-		Stream              bool              `json:"stream"`
+		Model         string `json:"model"`
+		Stream        bool   `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
 		ReasoningEffort     string            `json:"reasoning_effort"`
 		MaxTokens           *int              `json:"max_tokens"`
 		MaxCompletionTokens *int              `json:"max_completion_tokens"`
@@ -74,6 +78,7 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 	req := &chatRequest{
 		Model:           raw.Model,
 		Stream:          raw.Stream,
+		IncludeUsage:    raw.StreamOptions.IncludeUsage,
 		ReasoningEffort: strings.ToLower(strings.TrimSpace(raw.ReasoningEffort)),
 		MaxTokens:       raw.MaxTokens,
 		Temperature:     raw.Temperature,

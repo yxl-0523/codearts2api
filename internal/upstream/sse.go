@@ -41,6 +41,7 @@ type RawCompletion struct {
 	Reasoning string
 	Finish    string
 	ToolCalls []ChatToolCall
+	Usage     map[string]any
 }
 
 // scanLine 处理一行 SSE：CodeArts 是逐行 data:（无空行分隔），
@@ -399,6 +400,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		finish  = "stop"
 		upErr   error
 		calls   = make(toolCallAccumulator)
+		usage   map[string]any
 	)
 	var pendingEvent string
 	for {
@@ -409,6 +411,9 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
 			var payload map[string]any
 			if json.Unmarshal([]byte(data), &payload) == nil {
+				if u, ok := payload["usage"].(map[string]any); ok {
+					usage = u
+				}
 				delta, _ := deltaFromChunk(payload)
 				applyToolCallDeltas(delta, calls)
 			}
@@ -426,6 +431,7 @@ func AggregateRaw(r io.Reader) (*RawCompletion, error) {
 		Reasoning: reason.String(),
 		Finish:    finish,
 		ToolCalls: sortedToolCalls(calls),
+		Usage:     usage,
 	}, nil
 }
 
@@ -456,15 +462,17 @@ func Aggregate(r io.Reader, model string) (map[string]any, error) {
 
 // Stream 实时转换 SSE，保证至少一个 [DONE]。
 func Stream(w http.ResponseWriter, r io.Reader, model string) error {
-	return streamWithCapture(w, r, model, nil)
+	return StreamCaptureWithUsage(w, r, model, nil, nil)
 }
 
 // StreamCapture 同 Stream，正常结束时回调聚合结果。
 func StreamCapture(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion)) error {
-	return streamWithCapture(w, r, model, onDone)
+	return StreamCaptureWithUsage(w, r, model, onDone, nil)
 }
 
-func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion)) error {
+// StreamCaptureWithUsage emits a final usage chunk when usageFor is non-nil.
+// usageFor can supply an estimate when the upstream omits usage.
+func StreamCaptureWithUsage(w http.ResponseWriter, r io.Reader, model string, onDone func(*RawCompletion), usageFor func(*RawCompletion) map[string]any) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -481,9 +489,13 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 		finish    = "stop"
 		streamErr error
 		calls     = make(toolCallAccumulator)
+		usage     map[string]any
 	)
 	var pendingEvent string
 
+	completion := func() *RawCompletion {
+		return &RawCompletion{Content: unwrapQAContent(content.String()), Reasoning: reason.String(), Finish: finish, ToolCalls: sortedToolCalls(calls), Usage: usage}
+	}
 	writeChunk := func(delta map[string]any, fin string) error {
 		choice := map[string]any{"index": 0, "delta": delta}
 		if fin != "" {
@@ -496,6 +508,9 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 			"model":   model,
 			"choices": []any{choice},
 		}
+		if usageFor != nil {
+			chunk["usage"] = nil
+		}
 		raw, _ := json.Marshal(chunk)
 		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
 			return err
@@ -505,7 +520,17 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 		}
 		return nil
 	}
-	writeDONE := func() error {
+	writeDONE := func(success bool) error {
+		if success && usageFor != nil {
+			chunk := map[string]any{
+				"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(),
+				"model": model, "choices": []any{}, "usage": usageFor(completion()),
+			}
+			raw, _ := json.Marshal(chunk)
+			if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
+				return err
+			}
+		}
 		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 			return err
 		}
@@ -535,7 +560,7 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 		if ev, data, ok := scanLine(strings.TrimRight(line, "\r\n"), &pendingEvent); ok {
 			if strings.TrimSpace(data) == "[DONE]" {
 				if !sawDone {
-					if werr := writeDONE(); werr != nil {
+					if werr := writeDONE(true); werr != nil {
 						streamErr = werr
 						break
 					}
@@ -545,6 +570,9 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 			}
 			var payload map[string]any
 			_ = json.Unmarshal([]byte(data), &payload)
+			if u, ok := payload["usage"].(map[string]any); ok {
+				usage = u
+			}
 			nativeDelta, nativeFinish := deltaFromChunk(payload)
 			applyToolCallDeltas(nativeDelta, calls)
 			var upErr error
@@ -555,7 +583,7 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 					streamErr = werr
 					break
 				}
-				if werr := writeDONE(); werr != nil {
+				if werr := writeDONE(false); werr != nil {
 					streamErr = werr
 					break
 				}
@@ -589,7 +617,7 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 						break
 					}
 				}
-				if werr := writeDONE(); werr != nil {
+				if werr := writeDONE(true); werr != nil {
 					streamErr = werr
 					break
 				}
@@ -604,15 +632,10 @@ func streamWithCapture(w http.ResponseWriter, r io.Reader, model string, onDone 
 		}
 	}
 	if streamErr == nil && !sawDone {
-		streamErr = writeDONE()
+		streamErr = writeDONE(true)
 	}
 	if streamErr == nil && onDone != nil {
-		onDone(&RawCompletion{
-			Content:   unwrapQAContent(content.String()),
-			Reasoning: reason.String(),
-			Finish:    finish,
-			ToolCalls: sortedToolCalls(calls),
-		})
+		onDone(completion())
 	}
 	return streamErr
 }
