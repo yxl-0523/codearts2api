@@ -113,6 +113,19 @@ func TestOAuthDirectCallbackCompletesSessionForPanelPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The portal first sends secret + redirect without an authorization code.
+	sess := h.oauth.get(start.SessionID)
+	nextURL := "https://codearts.huaweicloud.com/portal/callback?ticket_id=" + url.QueryEscape(sess.TicketID)
+	firstReq := httptest.NewRequest(http.MethodGet, "/oauth/callback?secret=portal-secret&redirect="+url.QueryEscape(nextURL), nil)
+	firstRec := httptest.NewRecorder()
+	h.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusTemporaryRedirect || firstRec.Header().Get("Location") != nextURL {
+		t.Fatalf("first callback status=%d location=%q body=%s", firstRec.Code, firstRec.Header().Get("Location"), firstRec.Body.String())
+	}
+	if got := h.oauth.get(start.SessionID); got.Secret != "portal-secret" || !got.TicketFallback {
+		t.Fatal("first callback did not retain the portal secret for ticket polling")
+	}
+
 	callbackReq := httptest.NewRequest(http.MethodGet, "/oauth/callback?code=AUTH_CODE", nil)
 	callbackRec := httptest.NewRecorder()
 	h.ServeHTTP(callbackRec, callbackReq)
